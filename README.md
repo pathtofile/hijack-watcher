@@ -1,0 +1,3 @@
+```
+logman stop HijackWatcher -ets
+```
