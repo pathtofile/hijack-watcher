@@ -3,13 +3,13 @@ use ferrisetw::parser::{Parser, TryParse};
 use ferrisetw::provider::*;
 use ferrisetw::schema::SchemaLocator;
 use ferrisetw::trace::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap};
 use std::error::Error;
+use std::result::Result;
 use std::sync::Mutex;
 use std::time::Duration;
-use std::result::Result;
 
-use windows::{core::*, Win32::Foundation::*, Win32::Storage::FileSystem::*};
+use windows::{core::*, Win32::Storage::FileSystem::*};
 
 #[macro_use]
 extern crate lazy_static;
@@ -69,7 +69,7 @@ macro_rules! e {
 
 fn update_device_path_map() -> Result<(), Box<dyn Error>> {
     let mut map = e!(DEVICE_MAP.lock(), "Failed to get device map mutex")?;
-    let mut device_path: [u16; 1024] = [0;1024];
+    let mut device_path: [u16; 1024] = [0; 1024];
 
     // Check every possible drive letter
     for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ".to_string().chars() {
@@ -83,7 +83,10 @@ fn update_device_path_map() -> Result<(), Box<dyn Error>> {
 
             let r = QueryDosDeviceW(dos_path16, Some(device_path.as_mut_slice()));
             if r > 0 {
-                let device_path = e!(PCWSTR(device_path.as_mut_ptr()).to_string(), "Failed to convert dive_path to rust string")?;
+                let device_path = e!(
+                    PCWSTR(device_path.as_mut_ptr()).to_string(),
+                    "Failed to convert dive_path to rust string"
+                )?;
                 println!("map['{device_path}'] = '{dos_path}'");
                 map.insert(device_path, dos_path);
             }
@@ -92,10 +95,8 @@ fn update_device_path_map() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-
-
-fn check_permissions(mut path: String)  -> Result<(), Box<dyn Error>> {
-    let split: Vec<&str> = path.split("\\").collect();
+fn check_permissions(mut path: String) -> Result<(), Box<dyn Error>> {
+    let split: Vec<&str> = path.split('\\').collect();
     if split.len() < 3 {
         return Ok(());
     }
@@ -175,7 +176,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     std::thread::sleep(Duration::new(10000, 0));
     trace.stop();
-    
+
     println!("----------------");
     Ok(())
 }
