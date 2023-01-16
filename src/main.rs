@@ -1,25 +1,28 @@
+use std::collections::{HashMap, HashSet};
+use std::error::Error;
+use std::ffi::c_void;
+use std::fs::{remove_file, OpenOptions};
+use std::io::ErrorKind::{NotFound, PermissionDenied};
+use std::mem::size_of_val;
+use std::path::Path;
+use std::result::Result;
+use std::sync::mpsc::Sender;
+use std::sync::{mpsc, Arc, Mutex, MutexGuard};
+
+
 use ferrisetw::parser::Parser;
 use ferrisetw::provider::*;
 use ferrisetw::schema_locator::SchemaLocator;
 use ferrisetw::trace::*;
 use ferrisetw::EventRecord;
-use std::collections::{HashMap, HashSet};
-use std::error::Error;
-use std::ffi::c_void;
-use std::fs::{self, remove_file};
-use std::io::ErrorKind::{NotFound, PermissionDenied};
-use std::mem::size_of_val;
-use std::path::Path;
-use std::result::Result;
-use std::sync::{Mutex, MutexGuard};
 
+use windows::core::*;
 use windows::Win32::Foundation::*;
-use windows::Win32::Foundation::{BOOL, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Security::AppLocker::*;
 use windows::Win32::Security::Authorization::*;
 use windows::Win32::Security::*;
+use windows::Win32::Storage::FileSystem::*;
 use windows::Win32::System::SystemServices::*;
-use windows::{core::*, Win32::Storage::FileSystem::*};
 
 #[macro_use]
 extern crate lazy_static;
@@ -99,7 +102,7 @@ fn check_permissions(filename: &String) -> Result<(), Box<dyn Error>> {
     }
 
     let mut opened = false;
-    match fs::OpenOptions::new()
+    match OpenOptions::new()
         .create(true)
         .append(true) // So we don't overwrite existing data
         .open(path)
@@ -126,7 +129,7 @@ fn check_permissions(filename: &String) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn resolve_path(mut path: String) -> Result<(), Box<dyn Error>> {
+fn check_path(mut path: String, tx: &Arc<Mutex<Sender<String>>>) -> Result<(), Box<dyn Error>> {
     let split: Vec<&str> = path.split('\\').collect();
     if split.len() < 3 {
         return Ok(());
@@ -148,14 +151,21 @@ fn resolve_path(mut path: String) -> Result<(), Box<dyn Error>> {
 
     let mut files = FILES.lock().or(Err("Failed to get Device map"))?;
     if !files.contains(&path) {
-        check_permissions(&path)?;
+        let txpath = path.clone();
+        if let Ok(tx) = tx.lock() {
+            tx.send(txpath).unwrap();
+        }
         files.insert(path);
     }
 
     Ok(())
 }
 
-fn callback_file_io(record: &EventRecord, schema_locator: &SchemaLocator) {
+fn callback_file_io(
+    record: &EventRecord,
+    schema_locator: &SchemaLocator,
+    tx: &Arc<Mutex<Sender<String>>>,
+) {
     // We locate the Schema for the Event
     let schema = u!(schema_locator.event_schema(record));
 
@@ -183,7 +193,7 @@ fn callback_file_io(record: &EventRecord, schema_locator: &SchemaLocator) {
 
         if let Ok(mut map) = IRP_MAP.lock() {
             let filename = r!(map.get(&irp));
-            _ = resolve_path(filename.clone());
+            _ = check_path(filename.clone(), tx);
             map.remove(&irp);
         }
     }
@@ -267,22 +277,43 @@ fn lower_privs() {
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("----------------");
-    std::thread::spawn(|| {
+    // Create channel for ITC
+    let (tx1, rx) = mpsc::channel();
+    let tx2 = tx1.clone();
+    let tx1 = Arc::new(Mutex::new(tx1));
+    let tx2 = Arc::new(Mutex::new(tx2));
+
+    // Start thread to handle permissions check
+    std::thread::spawn(move || {
         lower_privs();
-        // TODO: Loop and get paths
+        loop {
+            let path: String = rx.recv().unwrap();
+            _ = check_permissions(&path);
+        }
     });
 
+    // Update device map
     if let Ok(mut map) = DEVICE_MAP.lock() {
         update_device_path_map(&mut map)?;
     }
 
+    // Prepare ETW Providers
     let provider_io = Provider::kernel(&kernel_providers::FILE_IO_PROVIDER)
-        .add_callback(callback_file_io)
+        .add_callback(
+            move |record: &EventRecord, schema_locator: &SchemaLocator| {
+                callback_file_io(record, schema_locator, &tx1);
+            },
+        )
         .build();
     let provider_init_io = Provider::kernel(&kernel_providers::FILE_INIT_IO_PROVIDER)
-        .add_callback(callback_file_io)
+        .add_callback(
+            move |record: &EventRecord, schema_locator: &SchemaLocator| {
+                callback_file_io(record, schema_locator, &tx2);
+            },
+        )
         .build();
 
+    // Prepare ETW Session
     let (mut trace, _) = KernelTrace::new()
         .named(String::from("HijackWatcher"))
         .enable(provider_io)
