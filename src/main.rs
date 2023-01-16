@@ -1,18 +1,17 @@
-use ferrisetw::native::etw_types::EventRecord;
-use ferrisetw::parser::{Parser, TryParse};
+use ferrisetw::parser::Parser;
 use ferrisetw::provider::*;
-use ferrisetw::schema::SchemaLocator;
+use ferrisetw::schema_locator::SchemaLocator;
 use ferrisetw::trace::*;
+use ferrisetw::EventRecord;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::ffi::c_void;
 use std::fs::{self, remove_file};
 use std::io::ErrorKind::{NotFound, PermissionDenied};
-use std::mem::{size_of_val};
+use std::mem::size_of_val;
 use std::path::Path;
 use std::result::Result;
 use std::sync::{Mutex, MutexGuard};
-
 
 use windows::Win32::Foundation::*;
 use windows::Win32::Foundation::{BOOL, HANDLE, INVALID_HANDLE_VALUE};
@@ -156,44 +155,38 @@ fn resolve_path(mut path: String) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn callback_file_io(record: EventRecord, schema_locator: &mut SchemaLocator) {
+fn callback_file_io(record: &EventRecord, schema_locator: &SchemaLocator) {
     // We locate the Schema for the Event
-    match schema_locator.event_schema(record) {
-        Ok(schema) => {
-            let opcode = schema.opcode();
-            let _pid = record.EventHeader.ProcessId;
-            if opcode == EVENT_FILEIO_CREATE {
-                let mut parser = Parser::create(&schema);
+    let schema = u!(schema_locator.event_schema(record));
 
-                let filename = u!(TryParse::<String>::try_parse(&mut parser, "OpenPath"));
-                if !filename.to_lowercase().ends_with(END) {
-                    return;
-                }
-
-                let irp = u!(TryParse::<u64>::try_parse(&mut parser, "IrpPtr"));
-                if let Ok(mut map) = IRP_MAP.lock() {
-                    map.insert(irp, filename);
-                }
-            } else if opcode == EVENT_FILEIO_OP_END {
-                let mut parser = Parser::create(&schema);
-                let status = u!(TryParse::<u32>::try_parse(&mut parser, "NtStatus"));
-
-                if status != NAME_NOT_FOUND && status != PATH_NOT_FOUND {
-                    return;
-                }
-                let irp = u!(TryParse::<u64>::try_parse(&mut parser, "IrpPtr"));
-
-                if let Ok(mut map) = IRP_MAP.lock() {
-                    let filename = r!(map.get(&irp));
-                    _ = resolve_path(filename.clone());
-                    map.remove(&irp);
-                }
-            }
+    let opcode = record.opcode();
+    let _pid = record.process_id();
+    if opcode == EVENT_FILEIO_CREATE {
+        let parser = Parser::create(record, &schema);
+        let filename = u!(parser.try_parse::<String>("OpenPath"));
+        if !filename.to_lowercase().ends_with(END) {
+            return;
         }
-        Err(_err) => {
-            // println!("Error {:?}", err)
+
+        let irp = u!(parser.try_parse::<u64>("IrpPtr"));
+        if let Ok(mut map) = IRP_MAP.lock() {
+            map.insert(irp, filename);
         }
-    };
+    } else if opcode == EVENT_FILEIO_OP_END {
+        let parser = Parser::create(record, &schema);
+        let status = u!(parser.try_parse::<u32>("NtStatus"));
+
+        if status != NAME_NOT_FOUND && status != PATH_NOT_FOUND {
+            return;
+        }
+        let irp = u!(parser.try_parse::<u64>("IrpPtr"));
+
+        if let Ok(mut map) = IRP_MAP.lock() {
+            let filename = r!(map.get(&irp));
+            _ = resolve_path(filename.clone());
+            map.remove(&irp);
+        }
+    }
 }
 
 // Lower Privliges to regular user
@@ -285,22 +278,21 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let provider_io = Provider::kernel(&kernel_providers::FILE_IO_PROVIDER)
         .add_callback(callback_file_io)
-        .build()
-        .unwrap();
+        .build();
     let provider_init_io = Provider::kernel(&kernel_providers::FILE_INIT_IO_PROVIDER)
         .add_callback(callback_file_io)
-        .build()
-        .unwrap();
+        .build();
 
-    let mut trace = KernelTrace::new()
+    let (mut trace, _) = KernelTrace::new()
         .named(String::from("HijackWatcher"))
         .enable(provider_io)
         .enable(provider_init_io)
         .start()
         .unwrap();
 
-    std::thread::sleep(std::time::Duration::from_secs(10 * 60));
-    trace.stop();
+    // Trace on current thread
+    trace.process().unwrap();
+    trace.stop().unwrap();
     println!("----------------");
     Ok(())
 }
