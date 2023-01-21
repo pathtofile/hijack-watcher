@@ -9,7 +9,6 @@ use std::result::Result;
 use std::sync::mpsc::Sender;
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 
-
 use ferrisetw::parser::Parser;
 use ferrisetw::provider::*;
 use ferrisetw::schema_locator::SchemaLocator;
@@ -24,6 +23,16 @@ use windows::Win32::Security::*;
 use windows::Win32::Storage::FileSystem::*;
 use windows::Win32::System::SystemServices::*;
 
+struct ETWEvent {
+    pid: u32,
+    commandline: String,
+    imagename: String,
+}
+struct FEvent {
+    etw_event: ETWEvent,
+    filename: String,
+}
+
 #[macro_use]
 extern crate lazy_static;
 
@@ -32,10 +41,17 @@ lazy_static! {
     static ref IRP_MAP: Mutex<HashMap<u64, String>> = Mutex::new(HashMap::new());
     static ref DEVICE_MAP: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
     static ref FILES: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+    static ref PID_MAP: Mutex<HashMap<u32, ETWEvent>> = Mutex::new(HashMap::new());
 }
 
+// FileIO ETW Event IDs
 const EVENT_FILEIO_CREATE: u8 = 64;
 const EVENT_FILEIO_OP_END: u8 = 76;
+
+// Process ETW Event IDs
+const EVENT_TRACE_TYPE_START: u8 = 1;
+const EVENT_TRACE_TYPE_END: u8 = 2;
+const EVENT_TRACE_TYPE_DCSTART: u8 = 3;
 
 const NAME_NOT_FOUND: u32 = 0xc0000034;
 const PATH_NOT_FOUND: u32 = 0xc000003a;
@@ -54,16 +70,16 @@ macro_rules! u {
     };
 }
 
-macro_rules! r {
-    ( $e:expr ) => {
-        match $e {
-            Some(x) => x,
-            None => {
-                return;
-            }
-        }
-    };
-}
+// macro_rules! r {
+//     ( $e:expr ) => {
+//         match $e {
+//             Some(x) => x,
+//             None => {
+//                 return;
+//             }
+//         }
+//     };
+// }
 
 fn update_device_path_map(
     map: &mut MutexGuard<HashMap<String, String>>,
@@ -94,7 +110,11 @@ fn update_device_path_map(
     Ok(())
 }
 
-fn check_permissions(filename: &String) -> Result<(), Box<dyn Error>> {
+fn check_permissions(event: &FEvent) -> Result<(), Box<dyn Error>> {
+    let filename = &event.filename;
+    let imagename = &event.etw_event.imagename;
+    let pid = &event.etw_event.pid;
+    let cmdline = &event.etw_event.commandline;
     let path = Path::new(&filename);
     let aready_existed = path.exists();
     if aready_existed {
@@ -108,18 +128,18 @@ fn check_permissions(filename: &String) -> Result<(), Box<dyn Error>> {
         .open(path)
     {
         Ok(_) => {
-            println!("[+] Opened - {filename}");
+            println!("[+] {pid} - {imagename} ({cmdline}) - Opened - {filename}");
             opened = true;
         }
         Err(error) => match error.kind() {
             PermissionDenied => {
-                println!("[ ] PermissionDenied - {filename}");
+                println!("[ ] {imagename} - PermissionDenied - {filename}");
             }
             NotFound => {
-                println!("[ ] NotFound - {filename}");
+                println!("[ ] {imagename} - NotFound - {filename}");
             }
             err => {
-                println!("[ ] Other Error - {err} - {filename}");
+                println!("[ ] {imagename} - Other Error - {err} - {filename}");
             }
         },
     }
@@ -129,33 +149,42 @@ fn check_permissions(filename: &String) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn check_path(mut path: String, tx: &Arc<Mutex<Sender<String>>>) -> Result<(), Box<dyn Error>> {
-    let split: Vec<&str> = path.split('\\').collect();
+fn check_path(
+    event: &ETWEvent,
+    mut filename: String,
+    tx: &Arc<Mutex<Sender<FEvent>>>,
+) -> Result<(), Box<dyn Error>> {
+    let split: Vec<&str> = filename.split('\\').collect();
     if split.len() < 3 {
         return Ok(());
     }
 
     let dos_path = "\\".to_string() + &split[1..3].join("\\");
-
     let mut map = DEVICE_MAP.lock().or(Err("Failed to get Device map"))?;
-
     if let Some(device_path) = map.get(&dos_path) {
-        path.replace_range(..dos_path.len(), device_path);
+        filename.replace_range(..dos_path.len(), device_path);
     } else {
         // Maybe map needs updating, e.g. new device plugged in
         update_device_path_map(&mut map)?;
         if let Some(device_path) = map.get(&dos_path) {
-            path.replace_range(..dos_path.len(), device_path);
+            filename.replace_range(..dos_path.len(), device_path);
         }
     }
 
     let mut files = FILES.lock().or(Err("Failed to get Device map"))?;
-    if !files.contains(&path) {
-        let txpath = path.clone();
+    if !files.contains(&filename) {
         if let Ok(tx) = tx.lock() {
-            tx.send(txpath).unwrap();
+            let fevent = FEvent {
+                etw_event: ETWEvent {
+                    pid: event.pid,
+                    commandline: event.commandline.clone(),
+                    imagename: event.imagename.clone(),
+                },
+                filename: filename.clone(),
+            };
+            tx.send(fevent).unwrap();
         }
-        files.insert(path);
+        files.insert(filename);
     }
 
     Ok(())
@@ -164,39 +193,92 @@ fn check_path(mut path: String, tx: &Arc<Mutex<Sender<String>>>) -> Result<(), B
 fn callback_file_io(
     record: &EventRecord,
     schema_locator: &SchemaLocator,
-    tx: &Arc<Mutex<Sender<String>>>,
-) {
+    tx: &Arc<Mutex<Sender<FEvent>>>,
+) -> Result<(), Box<dyn Error>> {
+    // We locate the Schema for the Event
+    let schema = schema_locator
+        .event_schema(record)
+        .or(Err("Failed to get Event Schema"))?;
+
+    let opcode = record.opcode();
+    let pid = record.process_id();
+
+    match opcode {
+        EVENT_FILEIO_CREATE => {
+            let parser = Parser::create(record, &schema);
+            let filename = parser
+                .try_parse::<String>("OpenPath")
+                .or(Err("Failed to parse OpenPath"))?;
+            if !filename.to_lowercase().ends_with(END) {
+                return Ok(());
+            }
+
+            let irp = parser
+                .try_parse::<u64>("IrpPtr")
+                .or(Err("Failed to parse IrpPtr"))?;
+            if let Ok(mut map) = IRP_MAP.lock() {
+                map.insert(irp, filename);
+            }
+        }
+        EVENT_FILEIO_OP_END => {
+            let parser = Parser::create(record, &schema);
+            let status = parser
+                .try_parse::<u32>("NtStatus")
+                .or(Err("Failed to parse NtStatus"))?;
+
+            if status != NAME_NOT_FOUND && status != PATH_NOT_FOUND {
+                return Ok(());
+            }
+            let irp = parser
+                .try_parse::<u64>("IrpPtr")
+                .or(Err("Failed to parse IrpPtr"))?;
+
+            let mut map_pid = PID_MAP.lock().or(Err("Failed to get Device map"))?;
+            let event = map_pid.get_mut(&pid).ok_or("Failed to fin pid in map")?;
+
+            let mut map_irp = IRP_MAP.lock().or(Err("Failed to get Device map"))?;
+            let filename = map_irp.get(&irp).ok_or("Failed to fin IRP in map")?;
+
+            let err = check_path(event, filename.clone(), tx);
+            map_irp.remove(&irp);
+            err?;
+        }
+        _ => {}
+    };
+
+    Ok(())
+}
+
+fn callback_process(record: &EventRecord, schema_locator: &SchemaLocator) {
     // We locate the Schema for the Event
     let schema = u!(schema_locator.event_schema(record));
 
     let opcode = record.opcode();
-    let _pid = record.process_id();
-    if opcode == EVENT_FILEIO_CREATE {
-        let parser = Parser::create(record, &schema);
-        let filename = u!(parser.try_parse::<String>("OpenPath"));
-        if !filename.to_lowercase().ends_with(END) {
-            return;
-        }
 
-        let irp = u!(parser.try_parse::<u64>("IrpPtr"));
-        if let Ok(mut map) = IRP_MAP.lock() {
-            map.insert(irp, filename);
+    match opcode {
+        EVENT_TRACE_TYPE_START | EVENT_TRACE_TYPE_DCSTART => {
+            let parser = Parser::create(record, &schema);
+            let imagename = u!(parser.try_parse::<String>("ImageFileName"));
+            let commandline = u!(parser.try_parse::<String>("CommandLine"));
+            let pid = u!(parser.try_parse::<u32>("ProcessId"));
+            let event = ETWEvent {
+                pid,
+                commandline,
+                imagename,
+            };
+            if let Ok(mut map) = PID_MAP.lock() {
+                map.insert(pid, event);
+            }
         }
-    } else if opcode == EVENT_FILEIO_OP_END {
-        let parser = Parser::create(record, &schema);
-        let status = u!(parser.try_parse::<u32>("NtStatus"));
-
-        if status != NAME_NOT_FOUND && status != PATH_NOT_FOUND {
-            return;
+        EVENT_TRACE_TYPE_END => {
+            if let Ok(mut map) = PID_MAP.lock() {
+                let parser = Parser::create(record, &schema);
+                let pid = u!(parser.try_parse::<u32>("ProcessId"));
+                map.remove(&pid);
+            }
         }
-        let irp = u!(parser.try_parse::<u64>("IrpPtr"));
-
-        if let Ok(mut map) = IRP_MAP.lock() {
-            let filename = r!(map.get(&irp));
-            _ = check_path(filename.clone(), tx);
-            map.remove(&irp);
-        }
-    }
+        _ => {}
+    };
 }
 
 // Lower Privliges to regular user
@@ -287,8 +369,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     std::thread::spawn(move || {
         lower_privs();
         loop {
-            let path: String = rx.recv().unwrap();
-            _ = check_permissions(&path);
+            let event: FEvent = rx.recv().unwrap();
+            _ = check_permissions(&event);
         }
     });
 
@@ -301,23 +383,28 @@ fn main() -> Result<(), Box<dyn Error>> {
     let provider_io = Provider::kernel(&kernel_providers::FILE_IO_PROVIDER)
         .add_callback(
             move |record: &EventRecord, schema_locator: &SchemaLocator| {
-                callback_file_io(record, schema_locator, &tx1);
+                _ = callback_file_io(record, schema_locator, &tx1);
             },
         )
         .build();
     let provider_init_io = Provider::kernel(&kernel_providers::FILE_INIT_IO_PROVIDER)
         .add_callback(
             move |record: &EventRecord, schema_locator: &SchemaLocator| {
-                callback_file_io(record, schema_locator, &tx2);
+                _ = callback_file_io(record, schema_locator, &tx2);
             },
         )
+        .build();
+
+    let provider_process = Provider::kernel(&kernel_providers::PROCESS_PROVIDER)
+        .add_callback(callback_process)
         .build();
 
     // Prepare ETW Session
     let (mut trace, _) = KernelTrace::new()
         .named(String::from("HijackWatcher"))
-        .enable(provider_io)
+        .enable(provider_process)
         .enable(provider_init_io)
+        .enable(provider_io)
         .start()
         .unwrap();
 
