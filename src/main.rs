@@ -1,4 +1,3 @@
-use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::ffi::c_void;
@@ -8,8 +7,12 @@ use std::mem::size_of_val;
 use std::path::Path;
 use std::process::Command;
 use std::result::Result;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
+
+use clap::Parser as ClapParser;
+use serde_json::json;
 
 use ferrisetw::parser::Parser;
 use ferrisetw::provider::*;
@@ -53,11 +56,40 @@ struct FEvent {
 extern crate lazy_static;
 
 lazy_static! {
-    static ref IRP_MAP_PID: Mutex<HashMap<u32, HashMap<u64, String>>> = Mutex::new(HashMap::new());
     static ref IRP_MAP: Mutex<HashMap<u64, String>> = Mutex::new(HashMap::new());
     static ref DEVICE_MAP: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
     static ref FILES: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
     static ref PID_MAP: Mutex<HashMap<u32, ETWEvent>> = Mutex::new(HashMap::new());
+}
+
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+// This is a "simple" macro to do verbose printing
+macro_rules! vprintln {
+    ($fmt_str:literal) => {{
+        if VERBOSE.load(Ordering::Relaxed) {
+            eprintln!($fmt_str);
+        }
+    }};
+
+    ($fmt_str:literal, $($args:expr),*) => {{
+        if VERBOSE.load(Ordering::Relaxed) {
+            eprintln!($fmt_str, $($args),*);
+        }
+    }};
+}
+
+// Setup Commandline args
+#[derive(ClapParser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// ETW Session Name
+    #[arg(short, long, default_value = "HijackWatcher")]
+    name: String,
+
+    /// Print verbose logging
+    #[arg(short, long)]
+    verbose: bool,
 }
 
 fn update_device_path_map(
@@ -81,7 +113,7 @@ fn update_device_path_map(
                 let device_path = PCWSTR(device_path.as_mut_ptr())
                     .to_string()
                     .or(Err("Failed to convert dive_path to rust string"))?;
-                println!("map['{device_path}'] = '{dos_path}'");
+                vprintln!("map['{device_path}'] = '{dos_path}'");
                 map.insert(device_path, dos_path);
             }
         }
@@ -107,7 +139,7 @@ fn check_permissions(event: &FEvent) -> Result<(), Box<dyn Error>> {
         .open(path)
     {
         Ok(_) => {
-            // println!("[+] {pid} - {imagename} ({cmdline}) - Opened - {filename}");
+            // vprintln!("[+] {pid} - {imagename} ({cmdline}) - Opened - {filename}");
             let j = json!({
                 "pid": pid,
                 "imagename": imagename,
@@ -119,13 +151,13 @@ fn check_permissions(event: &FEvent) -> Result<(), Box<dyn Error>> {
         }
         Err(error) => match error.kind() {
             PermissionDenied => {
-                println!("[ ] {imagename} - PermissionDenied - {filename}");
+                vprintln!("[ ] {imagename} - PermissionDenied - {filename}");
             }
             NotFound => {
-                println!("[ ] {imagename} - NotFound - {filename}");
+                vprintln!("[ ] {imagename} - NotFound - {filename}");
             }
             err => {
-                println!("[ ] {imagename} - Other Error - {err} - {filename}");
+                vprintln!("[ ] {imagename} - Other Error - {err} - {filename}");
             }
         },
     }
@@ -301,7 +333,7 @@ fn lower_privs() {
         let mut hlevel: SAFER_LEVEL_HANDLE = SAFER_LEVEL_HANDLE(0);
 
         res = SaferCreateLevel(
-            SAFER_SCOPEID_USER + 5,
+            SAFER_SCOPEID_USER,
             SAFER_LEVELID_NORMALUSER,
             SAFER_LEVEL_OPEN,
             &mut hlevel,
@@ -309,7 +341,7 @@ fn lower_privs() {
         )
         .as_bool();
         if !res {
-            println!("[e] SaferCreateLevel: {}", GetLastError().to_hresult());
+            vprintln!("[e] SaferCreateLevel: {}", GetLastError().to_hresult());
             return;
         }
 
@@ -322,7 +354,7 @@ fn lower_privs() {
         )
         .as_bool();
         if !res {
-            println!(
+            vprintln!(
                 "[e] SaferComputeTokenFromLevel: {}",
                 GetLastError().to_hresult()
             );
@@ -333,7 +365,7 @@ fn lower_privs() {
         let mut psid = PSID::default();
         res = ConvertStringSidToSidA(s!("S-1-16-8192"), &mut psid).as_bool();
         if !res {
-            println!(
+            vprintln!(
                 "[e] ConvertStringSidToSidA: {}",
                 GetLastError().to_hresult()
             );
@@ -354,27 +386,32 @@ fn lower_privs() {
 
         res = SetTokenInformation(token, TokenIntegrityLevel, tml_ptr, tml_size).as_bool();
         if !res {
-            println!("[e] SetTokenInformation: {}", GetLastError().to_hresult());
+            vprintln!("[e] SetTokenInformation: {}", GetLastError().to_hresult());
             return;
         }
 
         res = ImpersonateLoggedOnUser(token).as_bool();
         if !res {
-            println!(
+            vprintln!(
                 "[e] ImpersonateLoggedOnUser: {}",
                 GetLastError().to_hresult()
             );
             return;
         }
 
-        println!("Good?");
+        if VERBOSE.load(Ordering::Relaxed) {
+            vprintln!("[ ] Lowered thread privs?");
+        }
     }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
+    VERBOSE.store(args.verbose, Ordering::Relaxed);
+
     // Stop any existing trace
     Command::new("logman")
-        .args(["stop", "HijackWatcher", "-ets"])
+        .args(["stop", &args.name, "-ets"])
         .output()?;
 
     // Create channel for ITC
@@ -412,7 +449,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Prepare ETW Session
     let (mut trace, _) = KernelTrace::new()
-        .named(String::from("HijackWatcher"))
+        .named(args.name)
         .enable(provider_process)
         .enable(provider_init_io)
         .enable(provider_io)
@@ -431,6 +468,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Trace on current thread
     trace.process().unwrap();
     trace.stop().unwrap();
-    println!("----------------");
+    vprintln!("----------------");
     Ok(())
 }
