@@ -23,6 +23,20 @@ use windows::Win32::Security::*;
 use windows::Win32::Storage::FileSystem::*;
 use windows::Win32::System::SystemServices::*;
 
+// FileIO ETW Event IDs
+const EVENT_FILEIO_CREATE: u8 = 64;
+const EVENT_FILEIO_OP_END: u8 = 76;
+
+// Process ETW Event IDs
+const EVENT_TRACE_TYPE_START: u8 = 1;
+const EVENT_TRACE_TYPE_END: u8 = 2;
+const EVENT_TRACE_TYPE_DCSTART: u8 = 3;
+
+const NAME_NOT_FOUND: u32 = 0xc0000034;
+const PATH_NOT_FOUND: u32 = 0xc000003a;
+
+const END: &str = ".dll";
+
 struct ETWEvent {
     pid: u32,
     commandline: String,
@@ -43,43 +57,6 @@ lazy_static! {
     static ref FILES: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
     static ref PID_MAP: Mutex<HashMap<u32, ETWEvent>> = Mutex::new(HashMap::new());
 }
-
-// FileIO ETW Event IDs
-const EVENT_FILEIO_CREATE: u8 = 64;
-const EVENT_FILEIO_OP_END: u8 = 76;
-
-// Process ETW Event IDs
-const EVENT_TRACE_TYPE_START: u8 = 1;
-const EVENT_TRACE_TYPE_END: u8 = 2;
-const EVENT_TRACE_TYPE_DCSTART: u8 = 3;
-
-const NAME_NOT_FOUND: u32 = 0xc0000034;
-const PATH_NOT_FOUND: u32 = 0xc000003a;
-
-const END: &str = ".dll";
-
-macro_rules! u {
-    ( $e:expr ) => {
-        match $e {
-            Ok(x) => x,
-            Err(_err) => {
-                // println!("Error: {err:?} ");
-                return;
-            }
-        }
-    };
-}
-
-// macro_rules! r {
-//     ( $e:expr ) => {
-//         match $e {
-//             Some(x) => x,
-//             None => {
-//                 return;
-//             }
-//         }
-//     };
-// }
 
 fn update_device_path_map(
     map: &mut MutexGuard<HashMap<String, String>>,
@@ -195,16 +172,13 @@ fn callback_file_io(
     schema_locator: &SchemaLocator,
     tx: &Arc<Mutex<Sender<FEvent>>>,
 ) -> Result<(), Box<dyn Error>> {
-    // We locate the Schema for the Event
-    let schema = schema_locator
-        .event_schema(record)
-        .or(Err("Failed to get Event Schema"))?;
-
-    let opcode = record.opcode();
-    let pid = record.process_id();
-
-    match opcode {
+    match record.opcode() {
         EVENT_FILEIO_CREATE => {
+            // We locate the Schema for the Event
+            let schema = schema_locator
+                .event_schema(record)
+                .or(Err("Failed to get Event Schema"))?;
+
             let parser = Parser::create(record, &schema);
             let filename = parser
                 .try_parse::<String>("OpenPath")
@@ -221,6 +195,12 @@ fn callback_file_io(
             }
         }
         EVENT_FILEIO_OP_END => {
+            // We locate the Schema for the Event
+            let schema = schema_locator
+                .event_schema(record)
+                .or(Err("Failed to get Event Schema"))?;
+
+            let pid = record.process_id();
             let parser = Parser::create(record, &schema);
             let status = parser
                 .try_parse::<u32>("NtStatus")
@@ -236,7 +216,7 @@ fn callback_file_io(
             let mut map_pid = PID_MAP.lock().or(Err("Failed to get Device map"))?;
             let event = map_pid.get_mut(&pid).ok_or("Failed to fin pid in map")?;
 
-            let mut map_irp = IRP_MAP.lock().or(Err("Failed to get Device map"))?;
+            let mut map_irp = IRP_MAP.lock().or(Err("Failed to get IRP map"))?;
             let filename = map_irp.get(&irp).ok_or("Failed to fin IRP in map")?;
 
             let err = check_path(event, filename.clone(), tx);
@@ -249,18 +229,27 @@ fn callback_file_io(
     Ok(())
 }
 
-fn callback_process(record: &EventRecord, schema_locator: &SchemaLocator) {
-    // We locate the Schema for the Event
-    let schema = u!(schema_locator.event_schema(record));
-
-    let opcode = record.opcode();
-
-    match opcode {
+fn callback_process(
+    record: &EventRecord,
+    schema_locator: &SchemaLocator,
+) -> Result<(), Box<dyn Error>> {
+    match record.opcode() {
         EVENT_TRACE_TYPE_START | EVENT_TRACE_TYPE_DCSTART => {
+            // We locate the Schema for the Event
+            let schema = schema_locator
+                .event_schema(record)
+                .or(Err("Failed to get Event Schema"))?;
+
             let parser = Parser::create(record, &schema);
-            let imagename = u!(parser.try_parse::<String>("ImageFileName"));
-            let commandline = u!(parser.try_parse::<String>("CommandLine"));
-            let pid = u!(parser.try_parse::<u32>("ProcessId"));
+            let imagename = parser
+                .try_parse::<String>("ImageFileName")
+                .or(Err("Failed to parse ImageFileName"))?;
+            let commandline = parser
+                .try_parse::<String>("CommandLine")
+                .or(Err("Failed to parse commandline"))?;
+            let pid = parser
+                .try_parse::<u32>("ProcessId")
+                .or(Err("Failed to parse ProcessId"))?;
             let event = ETWEvent {
                 pid,
                 commandline,
@@ -271,43 +260,59 @@ fn callback_process(record: &EventRecord, schema_locator: &SchemaLocator) {
             }
         }
         EVENT_TRACE_TYPE_END => {
+            // We locate the Schema for the Event
+            let schema = schema_locator
+                .event_schema(record)
+                .or(Err("Failed to get Event Schema"))?;
+
+            // Possible race condition if we get this event before
+            // the final Image load events. Decided to ignore, as
+            // most image laods happen long before the process ends, usually
+            // much closer to the start of the process.
             if let Ok(mut map) = PID_MAP.lock() {
                 let parser = Parser::create(record, &schema);
-                let pid = u!(parser.try_parse::<u32>("ProcessId"));
+                let pid = parser
+                    .try_parse::<u32>("ProcessId")
+                    .or(Err("Failed to parse ProcessId"))?;
                 map.remove(&pid);
             }
         }
+        // Ignore other OPcodes
         _ => {}
     };
+
+    Ok(())
 }
 
 // Lower Privliges to regular user
 fn lower_privs() {
     unsafe {
-        let mut result: BOOL;
+        let mut res: bool;
         let mut token: HANDLE = INVALID_HANDLE_VALUE;
         let mut hlevel: SAFER_LEVEL_HANDLE = SAFER_LEVEL_HANDLE(0);
 
-        result = SaferCreateLevel(
-            SAFER_SCOPEID_USER,
+        res = SaferCreateLevel(
+            SAFER_SCOPEID_USER + 5,
             SAFER_LEVELID_NORMALUSER,
             SAFER_LEVEL_OPEN,
             &mut hlevel,
             None,
-        );
-        if result.0 == 0 {
+        )
+        .as_bool();
+        if !res {
             println!("[e] SaferCreateLevel: {}", GetLastError().to_hresult());
             return;
         }
 
-        result = SaferComputeTokenFromLevel(
+        res = SaferComputeTokenFromLevel(
             hlevel,
             None,
             &mut token,
             SAFER_COMPUTE_TOKEN_FROM_LEVEL_FLAGS(0),
             None,
-        );
-        if result.0 == 0 {
+        )
+        .as_bool();
+        if !res {
             println!(
                 "[e] SaferComputeTokenFromLevel: {}",
                 GetLastError().to_hresult()
@@ -317,8 +322,8 @@ fn lower_privs() {
         SaferCloseLevel(hlevel);
 
         let mut psid = PSID::default();
-        result = ConvertStringSidToSidA(s!("S-1-16-8192"), &mut psid);
-        if result.0 == 0 {
+        res = ConvertStringSidToSidA(s!("S-1-16-8192"), &mut psid).as_bool();
+        if !res {
             println!(
                 "[e] ConvertStringSidToSidA: {}",
                 GetLastError().to_hresult()
@@ -338,14 +343,14 @@ fn lower_privs() {
         let mut tml_size: u32 = size_of_val(&tml).try_into().unwrap();
         tml_size += GetLengthSid(tml.Label.Sid);
 
-        result = SetTokenInformation(token, TokenIntegrityLevel, tml_ptr, tml_size);
-        if result.0 == 0 {
+        res = SetTokenInformation(token, TokenIntegrityLevel, tml_ptr, tml_size).as_bool();
+        if !res {
             println!("[e] SetTokenInformation: {}", GetLastError().to_hresult());
             return;
         }
 
-        result = ImpersonateLoggedOnUser(token);
-        if result.0 == 0 {
+        res = ImpersonateLoggedOnUser(token).as_bool();
+        if !res {
             println!(
                 "[e] ImpersonateLoggedOnUser: {}",
                 GetLastError().to_hresult()
@@ -358,23 +363,13 @@ fn lower_privs() {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    println!("----------------");
     // Create channel for ITC
     let (tx1, rx) = mpsc::channel();
     let tx2 = tx1.clone();
     let tx1 = Arc::new(Mutex::new(tx1));
     let tx2 = Arc::new(Mutex::new(tx2));
 
-    // Start thread to handle permissions check
-    std::thread::spawn(move || {
-        lower_privs();
-        loop {
-            let event: FEvent = rx.recv().unwrap();
-            _ = check_permissions(&event);
-        }
-    });
-
-    // Update device map
+    // Setup device map
     if let Ok(mut map) = DEVICE_MAP.lock() {
         update_device_path_map(&mut map)?;
     }
@@ -396,7 +391,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         .build();
 
     let provider_process = Provider::kernel(&kernel_providers::PROCESS_PROVIDER)
-        .add_callback(callback_process)
+        .add_callback(|record: &EventRecord, schema_locator: &SchemaLocator| {
+            _ = callback_process(record, schema_locator);
+        })
         .build();
 
     // Prepare ETW Session
@@ -407,6 +404,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         .enable(provider_io)
         .start()
         .unwrap();
+
+    // Start thread to handle permissions check
+    std::thread::spawn(move || {
+        lower_privs();
+        loop {
+            let event: FEvent = rx.recv().unwrap();
+            _ = check_permissions(&event);
+        }
+    });
 
     // Trace on current thread
     trace.process().unwrap();
