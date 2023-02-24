@@ -28,6 +28,9 @@ use windows::Win32::Security::*;
 use windows::Win32::Storage::FileSystem::*;
 use windows::Win32::System::SystemServices::*;
 
+#[macro_use]
+extern crate lazy_static;
+
 // FileIO ETW Event IDs
 const EVENT_FILEIO_CREATE: u8 = 64;
 const EVENT_FILEIO_OP_END: u8 = 76;
@@ -51,9 +54,6 @@ struct FEvent {
     etw_event: ETWEvent,
     filename: String,
 }
-
-#[macro_use]
-extern crate lazy_static;
 
 lazy_static! {
     static ref IRP_MAP: Mutex<HashMap<u64, String>> = Mutex::new(HashMap::new());
