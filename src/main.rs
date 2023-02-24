@@ -1,3 +1,4 @@
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::ffi::c_void;
@@ -5,6 +6,7 @@ use std::fs::{remove_file, OpenOptions};
 use std::io::ErrorKind::{NotFound, PermissionDenied};
 use std::mem::size_of_val;
 use std::path::Path;
+use std::process::Command;
 use std::result::Result;
 use std::sync::mpsc::Sender;
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
@@ -105,7 +107,14 @@ fn check_permissions(event: &FEvent) -> Result<(), Box<dyn Error>> {
         .open(path)
     {
         Ok(_) => {
-            println!("[+] {pid} - {imagename} ({cmdline}) - Opened - {filename}");
+            // println!("[+] {pid} - {imagename} ({cmdline}) - Opened - {filename}");
+            let j = json!({
+                "pid": pid,
+                "imagename": imagename,
+                "cmdline": cmdline,
+                "filename": filename
+            });
+            println!("{j}");
             opened = true;
         }
         Err(error) => match error.kind() {
@@ -363,6 +372,11 @@ fn lower_privs() {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // Stop any existing trace
+    Command::new("logman")
+        .args(["stop", "HijackWatcher", "-ets"])
+        .output()?;
+
     // Create channel for ITC
     let (tx1, rx) = mpsc::channel();
     let tx2 = tx1.clone();
