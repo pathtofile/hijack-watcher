@@ -28,6 +28,7 @@ use windows::Win32::Security::*;
 use windows::Win32::Storage::FileSystem::*;
 use windows::Win32::System::SystemServices::*;
 
+
 #[macro_use]
 extern crate lazy_static;
 
@@ -55,6 +56,7 @@ struct FEvent {
     filename: String,
 }
 
+
 lazy_static! {
     static ref IRP_MAP: Mutex<HashMap<u64, String>> = Mutex::new(HashMap::new());
     static ref DEVICE_MAP: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
@@ -63,6 +65,7 @@ lazy_static! {
 }
 
 static VERBOSE: AtomicBool = AtomicBool::new(false);
+static PRETTY: AtomicBool = AtomicBool::new(false);
 
 // This is a "simple" macro to do verbose printing
 macro_rules! vprintln {
@@ -86,6 +89,10 @@ struct Args {
     /// ETW Session Name
     #[arg(short, long, default_value = "HijackWatcher")]
     name: String,
+
+    /// Pretty-print JSON
+    #[arg(short, long)]
+    pretty: bool,
 
     /// Print verbose logging
     #[arg(short, long)]
@@ -146,7 +153,11 @@ fn check_permissions(event: &FEvent) -> Result<(), Box<dyn Error>> {
                 "cmdline": cmdline,
                 "filename": filename
             });
-            println!("{j}");
+            if PRETTY.load(Ordering::Relaxed) {
+                println!("{}", serde_json::to_string_pretty(&j).unwrap());
+            } else {
+                println!("{}", j);
+            }
             opened = true;
         }
         Err(error) => match error.kind() {
@@ -228,6 +239,7 @@ fn callback_file_io(
                 return Ok(());
             }
 
+            // Use IrpPtr to link FILEIO Create and End Events
             let irp = parser
                 .try_parse::<u64>("IrpPtr")
                 .or(Err("Failed to parse IrpPtr"))?;
@@ -408,6 +420,7 @@ fn lower_privs() {
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     VERBOSE.store(args.verbose, Ordering::Relaxed);
+    PRETTY.store(args.pretty, Ordering::Relaxed);
 
     // Stop any existing trace
     Command::new("logman")
